@@ -1,0 +1,204 @@
+import cv2
+from ultralytics import YOLO
+import numpy as np
+from gtts import gTTS
+from playsound import playsound
+import tempfile
+from collections import deque
+import os
+import time
+
+# Load the YOLO models
+ball_model = YOLO("basketballModel.pt")
+pose_model = YOLO("yolov8s-pose.pt")
+
+# Open the video file (replace 'path_to_video.mp4' with your video file path)
+video_path = "IMG_1134.mov"  # Change this to your video file path
+cap = cv2.VideoCapture(video_path)
+
+# Initialize counters and positions
+dribble_count = 0
+step_count = 0
+prev_x_center = None
+prev_y_center = None
+prev_left_ankle_y = None
+prev_right_ankle_y = None
+prev_delta_y = None
+ball_not_detected_frames = 0
+max_ball_not_detected_frames = 20
+dribble_threshold = 18
+step_threshold = 5
+min_wait_frames = 7
+wait_frames = 0
+travel_detected = False
+travel_timestamp = None
+total_dribble_count = 0
+total_step_count = 0
+
+# Body part indices
+body_index = {"left_knee": 13, "right_knee": 14, "left_ankle": 15, "right_ankle": 16}
+
+# Frame dims & codec
+frame_width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+
+# Prepare travel footage folder
+if not os.path.exists("travel_footage"):
+    os.makedirs("travel_footage")
+
+# Buffer for pre‑travel frames
+frame_buffer       = deque(maxlen=30)
+save_frames        = 60
+frame_save_counter = 0
+saving             = False
+out                = None
+
+while cap.isOpened():
+    success, frame = cap.read()
+    if not success:
+        break
+
+    # 1) Flip the frame 180 degrees
+    frame = cv2.flip(frame, -1)
+
+    # 2) Buffer frame
+    frame_buffer.append(frame)
+
+    # 3) Ball detection & dribble counting
+    ball_results_list = ball_model(frame, verbose=False, conf=0.65)
+    ball_detected = False
+
+    for results in ball_results_list:
+        for bbox in results.boxes.xyxy:
+            x1, y1, x2, y2 = bbox[:4]
+            x_center = (x1 + x2) / 2
+            y_center = (y1 + y2) / 2
+
+            if prev_y_center is not None and prev_delta_y is not None:
+                delta_y = y_center - prev_y_center
+                if prev_delta_y > dribble_threshold and delta_y < -dribble_threshold:
+                    dribble_count += 1
+                    total_dribble_count += 1
+                prev_delta_y = y_center - prev_y_center
+            else:
+                prev_delta_y = None
+
+            prev_x_center = x_center
+            prev_y_center = y_center
+            ball_detected = True
+            ball_not_detected_frames = 0
+
+        # annotate ball
+        annotated_frame = results.plot()
+
+    if not ball_detected:
+        ball_not_detected_frames += 1
+    if ball_not_detected_frames >= max_ball_not_detected_frames:
+        step_count = 0
+
+    # 4) Pose detection
+    pose_results = pose_model(frame, verbose=False, conf=0.5)
+    res = pose_results[0]
+    kps_tensor = res.keypoints.data
+
+    if kps_tensor is None or kps_tensor.numel() == 0:
+        print("No human detected.")
+        pose_annotated_frame = res.plot()
+    else:
+        kps_np = kps_tensor.cpu().numpy()
+        rounded_results = np.round(kps_np, 1)
+
+        try:
+            l_knee  = rounded_results[0][ body_index["left_knee"]  ]
+            r_knee  = rounded_results[0][ body_index["right_knee"] ]
+            l_ankle = rounded_results[0][ body_index["left_ankle"] ]
+            r_ankle = rounded_results[0][ body_index["right_ankle"] ]
+
+            if (l_knee[2] > 0.5 and r_knee[2] > 0.5 and
+                l_ankle[2] > 0.5 and r_ankle[2] > 0.5):
+
+                if prev_left_ankle_y is not None and prev_right_ankle_y is not None and wait_frames == 0:
+                    left_diff  = abs(l_ankle[1] - prev_left_ankle_y)
+                    right_diff = abs(r_ankle[1] - prev_right_ankle_y)
+                    if max(left_diff, right_diff) > step_threshold:
+                        step_count += 1
+                        total_step_count += 1
+                        wait_frames = min_wait_frames
+
+                prev_left_ankle_y  = l_ankle[1]
+                prev_right_ankle_y = r_ankle[1]
+                if wait_frames > 0:
+                    wait_frames -= 1
+
+        except Exception:
+            print("Error reading joints.")
+
+        pose_annotated_frame = res.plot()
+
+    # 5) Combine ball & pose
+    combined_frame = cv2.addWeighted(annotated_frame, 0.6, pose_annotated_frame, 0.4, 0)
+
+    # overlay dribble count
+    cv2.putText(
+        combined_frame,
+        f"Dribble count: {total_dribble_count}",
+        (50, frame_height - 50),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1, (0,0,0), 4, cv2.LINE_AA
+    )
+
+    # 6) Travel detection logic
+    if ball_detected and step_count >= 2 and dribble_count == 0:
+        print("Travel detected!")
+        step_count = 0
+        travel_detected = True
+        travel_timestamp = time.time()
+
+        if not saving:
+            filename = os.path.join("travel_footage",
+                                    f"travel_{time.strftime('%Y%m%d-%H%M%S')}.mp4")
+            out = cv2.VideoWriter(filename, fourcc, 9,
+                                  (frame_width, frame_height))
+            # dump buffer
+            for f in frame_buffer:
+                out.write(f)
+            saving = True
+
+    if travel_detected and (time.time() - travel_timestamp) > 3:
+        travel_detected = False
+        total_dribble_count = 0
+        total_step_count = 0
+
+    if travel_detected:
+        blue = np.full_like(combined_frame, (255,0,0), dtype=np.uint8)
+        combined_frame = cv2.addWeighted(combined_frame, 0.7, blue, 0.3, 0)
+        cv2.putText(
+            combined_frame,
+            "Travel Detected!",
+            (frame_width - 600, 150),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            2, (255,255,255), 4, cv2.LINE_AA
+        )
+
+    if dribble_count > 0:
+        step_count = 0
+        dribble_count = 0
+
+    if saving:
+        out.write(frame)
+        frame_save_counter += 1
+        if frame_save_counter >= save_frames:
+            saving = False
+            frame_save_counter = 0
+            out.release()
+
+    cv2.imshow("Travel Detection", combined_frame)
+    if cv2.waitKey(1) & 0xFF == ord("q"):
+        break
+
+# cleanup
+if out is not None:
+    out.release()
+cap.release()
+cv2.destroyAllWindows()
